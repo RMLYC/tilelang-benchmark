@@ -104,19 +104,6 @@ def _extract_shape(row: Dict[str, str]) -> Tuple[int, int, int, int, bool]:
     return batch, seq_len, heads, dim, causal
 
 
-def _make_inputs(batch: int, seq_len: int, heads: int, dim: int,
-                 device: torch.device, dtype: torch.dtype,
-                 seed: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Create deterministic random Q, K, V and dout for a given shape."""
-    g = torch.Generator(device=device)
-    g.manual_seed(seed)
-    q = torch.randn(batch, seq_len, heads, dim, device=device, dtype=dtype, generator=g)
-    k = torch.randn_like(q, memory_format=torch.contiguous_format)
-    v = torch.randn_like(q, memory_format=torch.contiguous_format)
-    dout = torch.randn_like(q, memory_format=torch.contiguous_format)
-    return q, k, v, dout
-
-
 def _max_abs_rel_diff(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-6) -> Tuple[float, float]:
     """Return (max absolute error, max relative error)."""
     a32 = a.detach().float()
@@ -169,7 +156,7 @@ def run_compare(input_params: str, warmup: int, iters: int, output: str,
         batch, seq_len, heads, dim, causal = _extract_shape(row)
 
         # Generate deterministic inputs for this configuration
-        q, k, v, dout = _make_inputs(batch, seq_len, heads, dim, dev, dt, seed=1234 + idx)
+        q, k, v, dout = make_inputs(batch, seq_len, heads, dim, dev, dt, seed=1234 + idx)
 
         # Instantiate both kernels
         fa3 = FA3Kernel(batch=batch, seq_len=seq_len, heads=heads, dim=dim,
