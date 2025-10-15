@@ -3,11 +3,10 @@
 """
 torch_bench_mha.py
 
-使用 PyTorch 原生 SDPA 实现的 Multi-Head Attention 基准程序。
-目标是在支持的 GPU 上调用最高效的内核后端，并提供与类 FA3 相似的
-forward、backward 与 profile 接口，便于集成与横向对比。
-
-风格: Google Python Style
+Benchmark for Multi-Head Attention using PyTorch native SDPA.
+The goal is to invoke the most efficient kernel backend on supported GPUs,
+and provide forward, backward, and profile interfaces similar to FA3,
+for easy integration and comparison.
 """
 
 from __future__ import annotations
@@ -26,22 +25,22 @@ from mha_config import MHAConfig
 # ================================ Utilities ================================ #
 
 def _require_cuda() -> None:
-    """确保当前环境可用 CUDA 且设备就绪。"""
+    """Ensure CUDA is available and device is ready."""
     if not torch.cuda.is_available():
-        raise RuntimeError("未检测到可用的 CUDA 设备。请在支持 CUDA 的环境下运行。")
+        raise RuntimeError("No CUDA device detected. Please run in a CUDA-enabled environment.")
 
 
 def _sdpa_fastest_ctx():
-    """返回一个上下文，优先选择最快的 SDPA 后端。
-    优先 FLASH_ATTENTION，其次 EFFICIENT_ATTENTION（PyTorch 2.5+）。
-    若新 API 不可用，则回退到旧 API；再不行就空上下文。
+    """Return a context that prioritizes the fastest SDPA backend.
+    Prefer FLASH_ATTENTION, then EFFICIENT_ATTENTION (PyTorch 2.5+).
+    If new API is unavailable, fallback to old API; otherwise, use nullcontext.
     """
     try:
         from torch.nn.attention import sdpa_kernel, SDPBackend
-        # 新 API：按优先级指定后端
+        # New API: specify backend by priority
         return sdpa_kernel(backends=[SDPBackend.FLASH_ATTENTION])
     except Exception:
-        # 老版本回退（在新版本上会给出弃用告警，但可用）
+        # Fallback for older versions (deprecated warning on new versions but usable)
         try:
             return torch.backends.cuda.sdp_kernel(
                 enable_flash=True, enable_math=False, enable_mem_efficient=True
@@ -52,9 +51,9 @@ def _sdpa_fastest_ctx():
 
 
 def attn_flops_forward(cfg: MHAConfig) -> float:
-    """计算前向 FLOPs 的近似值，仅统计 QK^T 与 P·V 主项。
+    """Approximate FLOPs for forward pass, only counting main QK^T and P·V terms.
 
-    公式:
+    Formula:
       FLOPs ≈ 4 * B * H * S^2 * Hd
     """
     B, H, S, Hd = cfg.batch, cfg.heads, cfg.seq_len, cfg.dim
@@ -62,19 +61,19 @@ def attn_flops_forward(cfg: MHAConfig) -> float:
 
 
 def attn_flops_forward_backward(cfg: MHAConfig) -> float:
-    """估算前向加反向的总 FLOPs。
+    """Estimate total FLOPs for forward plus backward.
 
-    经验规律:
-      反向大约是前向的两倍，因此 FWD_BWD ≈ 3.5 × FWD。
+    Empirical rule:
+      Backward is about twice the forward, so FWD_BWD ≈ 3.5 × FWD.
     """
     return 3.5 * attn_flops_forward(cfg)
 
 
 def _make_inputs(cfg: MHAConfig, device: torch.device, seed: int = 17
                  ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """根据配置生成随机 Q, K, V。
+    """Generate random Q, K, V according to config.
 
-    形状:
+    Shapes:
       Q, K, V: [B, S, H, Hd]
     """
     g = torch.Generator(device=device)
@@ -89,7 +88,7 @@ def _make_inputs(cfg: MHAConfig, device: torch.device, seed: int = 17
 # ================================ Kernel Class ============================= #
 
 class TorchMHAKernel:
-    """基于 PyTorch SDPA 的 MHA 封装类。"""
+    """Wrapper class for PyTorch SDPA-based MHA."""
 
     def __init__(self,
                  batch: int,
@@ -99,16 +98,16 @@ class TorchMHAKernel:
                  causal: bool,
                  dtype: torch.dtype = torch.float16,
                  device: str = "cuda:0") -> None:
-        """初始化内核配置与运行环境。
+        """Initialize kernel config and runtime environment.
 
         Args:
-          batch: 批大小 B
-          seq_len: 序列长度 S
-          heads: 注意力头数 H
-          dim: 每头维度 Hd
-          causal: 是否使用因果掩码
-          dtype: torch.float16 或 torch.bfloat16
-          device: 设备字符串, 例如 "cuda:0"
+          batch: batch size B
+          seq_len: sequence length S
+          heads: number of attention heads H
+          dim: per-head dimension Hd
+          causal: whether to use causal mask
+          dtype: torch.float16 or torch.bfloat16
+          device: device string, e.g. "cuda:0"
         """
         _require_cuda()
 
@@ -131,19 +130,19 @@ class TorchMHAKernel:
                 k: torch.Tensor,
                 v: torch.Tensor,
                 softmax_scale: Optional[float] = None) -> torch.Tensor:
-        """执行前向计算。
+        """Run forward computation.
 
-        说明:
-          输入须为 [B, S, H, Hd]。本函数不做缓存，完全由调用者管理输入输出。
+        Note:
+          Input must be [B, S, H, Hd]. No caching, caller manages input/output.
 
         Args:
-          q: Query 张量 [B, S, H, Hd]
-          k: Key 张量 [B, S, H, Hd]
-          v: Value 张量 [B, S, H, Hd]
-          softmax_scale: softmax 缩放因子。不传则使用 1/sqrt(Hd)
+          q: Query tensor [B, S, H, Hd]
+          k: Key tensor [B, S, H, Hd]
+          v: Value tensor [B, S, H, Hd]
+          softmax_scale: softmax scaling factor. If not provided, use 1/sqrt(Hd)
 
         Returns:
-          输出张量 [B, S, H, Hd]
+          Output tensor [B, S, H, Hd]
         """
         cfg = self.cfg
 
@@ -151,13 +150,13 @@ class TorchMHAKernel:
         k = k.to(device=self.device, dtype=cfg.dtype)
         v = v.to(device=self.device, dtype=cfg.dtype)
 
-        # PyTorch SDPA 支持 [B, H, S, D] 或 [B, S, H, D]
-        # 这里直接使用 [B, H, S, D] 格式以匹配后端要求
+        # PyTorch SDPA supports [B, H, S, D] or [B, S, H, D]
+        # Here we use [B, H, S, D] to match backend requirements
         q_bhsd = q.transpose(1, 2)   # [B, H, S, D]
         k_bhsd = k.transpose(1, 2)
         v_bhsd = v.transpose(1, 2)
 
-        # is_causal 控制下三角掩码。scale 可覆盖默认缩放
+        # is_causal controls lower-triangular mask. scale can override default scaling
         with _sdpa_fastest_ctx():
             out_bhsd = F.scaled_dot_product_attention(
                 q_bhsd, k_bhsd, v_bhsd,
@@ -166,7 +165,7 @@ class TorchMHAKernel:
                 is_causal=cfg.causal,
                 scale=softmax_scale
             )
-        out = out_bhsd.transpose(1, 2).contiguous()  # 回到 [B, S, H, D]
+        out = out_bhsd.transpose(1, 2).contiguous()  # Back to [B, S, H, D]
         return out
 
     @torch.inference_mode(False)
@@ -177,20 +176,20 @@ class TorchMHAKernel:
                  dout: Optional[torch.Tensor] = None,
                  softmax_scale: Optional[float] = None
                  ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """对给定输入执行一次前向和反向，返回 dQ, dK, dV。
+        """Run one forward and backward pass, return dQ, dK, dV.
 
-        说明:
-          若不提供 dout，则使用均方损失构造标量 loss。
+        Note:
+          If dout is not provided, use MSE loss to construct scalar loss.
 
         Args:
-          q: Query 张量 [B, S, H, Hd]
-          k: Key 张量 [B, S, H, Hd]
-          v: Value 张量 [B, S, H, Hd]
-          dout: 上游梯度 [B, S, H, Hd]。不提供则内部构造标量损失
-          softmax_scale: softmax 缩放因子
+          q: Query tensor [B, S, H, Hd]
+          k: Key tensor [B, S, H, Hd]
+          v: Value tensor [B, S, H, Hd]
+          dout: upstream gradient [B, S, H, Hd]. If not provided, use scalar loss
+          softmax_scale: softmax scaling factor
 
         Returns:
-          三元组 (dQ, dK, dV)，形状均为 [B, S, H, Hd]
+          Tuple (dQ, dK, dV), all shape [B, S, H, Hd]
         """
         cfg = self.cfg
 
@@ -216,7 +215,7 @@ class TorchMHAKernel:
             loss = out.float().pow(2).mean()
         else:
             if dout.shape != out.shape:
-                raise ValueError(f"dout 形状 {dout.shape} 与 out 形状 {out.shape} 不一致")
+                raise ValueError(f"dout shape {dout.shape} does not match out shape {out.shape}")
             loss = (out * dout.to(out.dtype)).float().mean()
 
         loss.backward()
@@ -225,7 +224,7 @@ class TorchMHAKernel:
         d_k = k.grad.detach().clone()
         d_v = v.grad.detach().clone()
 
-        # 清理梯度，避免外部重复调用时累积
+        # Clear gradients to avoid accumulation on repeated calls
         for t in (q, k, v):
             if t.grad is not None:
                 t.grad.zero_()
@@ -245,24 +244,24 @@ class TorchMHAKernel:
                 do_backward: bool = False,
                 softmax_scale: Optional[float] = None
                 ) -> Dict[str, Optional[float]]:
-        """基准测试接口，返回延迟与 TFLOPs。
+        """Benchmark interface, return latency and TFLOPs.
 
-        说明:
-          若未提供 q, k, v，将根据 cfg 生成固定随机张量。
-          度量时将使用 CUDA events 并同步，确保时间准确。
+        Note:
+          If q, k, v are not provided, generate fixed random tensors from cfg.
+          CUDA events and synchronization are used for accurate timing.
 
         Args:
           q: Query [B, S, H, Hd]
           k: Key [B, S, H, Hd]
           v: Value [B, S, H, Hd]
-          dout: 上游梯度 [B, S, H, Hd]。do_backward 为 True 时可提供
-          warmup: 预热轮次
-          iters: 计时轮次
-          do_backward: 是否计量反向
-          softmax_scale: softmax 缩放因子
+          dout: upstream gradient [B, S, H, Hd]. Used if do_backward is True
+          warmup: warmup rounds
+          iters: timing rounds
+          do_backward: whether to measure backward
+          softmax_scale: softmax scaling factor
 
         Returns:
-          包含以下键的字典
+          Dictionary with keys:
             - fwd_latency_ms
             - fwd_tflops
             - bwd_latency_ms
@@ -281,14 +280,14 @@ class TorchMHAKernel:
         if dout is None:
             dout = torch.randn_like(q)
 
-        # 为了公平计时，固定输入
+        # Fix input for fair timing
         q_f = q.detach()
         k_f = k.detach()
         v_f = v.detach()
         dout_f = dout.detach()
 
         def _fwd_once(q_, k_, v_) -> torch.Tensor:
-            # 转为 [B, H, S, D]
+            # Convert to [B, H, S, D]
             with _sdpa_fastest_ctx():
                 out = F.scaled_dot_product_attention(
                     q_.transpose(1, 2), k_.transpose(1, 2), v_.transpose(1, 2),
@@ -297,12 +296,12 @@ class TorchMHAKernel:
                 )
             return out.transpose(1, 2).contiguous()
 
-        # 预热前向
+        # Warmup forward
         for _ in range(max(1, warmup)):
             out = _fwd_once(q_f, k_f, v_f)
             torch.cuda.synchronize()
 
-        # 前向计时
+        # Forward timing
         starter = torch.cuda.Event(enable_timing=True)
         ender = torch.cuda.Event(enable_timing=True)
         total_fwd_ms = 0.0
@@ -314,15 +313,15 @@ class TorchMHAKernel:
             total_fwd_ms += starter.elapsed_time(ender)
         avg_fwd_ms = total_fwd_ms / iters
 
-        # 计算前向 TFLOPs
+        # Compute forward TFLOPs
         fwd_flops = attn_flops_forward(cfg)
         fwd_tflops = fwd_flops / (avg_fwd_ms * 1e-3) / 1e12
 
-        # 可选反向
+        # Optional backward
         avg_bwd_ms: Optional[float] = None
         bwd_tflops: Optional[float] = None
         if do_backward:
-            # 预热前向加反向
+            # Warmup forward + backward
             for _ in range(max(1, warmup)):
                 q_b = q_f.clone().detach().requires_grad_(True)
                 k_b = k_f.clone().detach().requires_grad_(True)
@@ -332,7 +331,7 @@ class TorchMHAKernel:
                 loss.backward()
                 torch.cuda.synchronize()
 
-            # 计时前向加反向
+            # Timing forward + backward
             total_fb_ms = 0.0
             for _ in range(iters):
                 q_b = q_f.clone().detach().requires_grad_(True)
@@ -348,10 +347,10 @@ class TorchMHAKernel:
                 total_fb_ms += starter.elapsed_time(ender)
 
             avg_fb_ms = total_fb_ms / iters
-            # 反向时间用总时间减去仅前向时间
+            # Backward time is total time minus forward-only time
             avg_bwd_ms = max(0.0, avg_fb_ms - avg_fwd_ms)
 
-            # 反向 FLOPs 近似值
+            # Backward FLOPs estimate
             fwd_bwd_flops = attn_flops_forward_backward(cfg)
             bwd_flops = max(0.0, fwd_bwd_flops - fwd_flops)
             bwd_tflops = bwd_flops / (avg_bwd_ms * 1e-3) / 1e12 if avg_bwd_ms > 0 else None
@@ -367,16 +366,16 @@ class TorchMHAKernel:
 # =================================== CLI =================================== #
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="PyTorch SDPA MHA 基准测试。")
-    parser.add_argument("--batch", type=int, required=True, help="批大小 B")
-    parser.add_argument("--seq_len", type=int, required=True, help="序列长度 S")
-    parser.add_argument("--heads", type=int, required=True, help="注意力头数 H")
-    parser.add_argument("--dim", type=int, required=True, help="每头维度 Hd")
-    parser.add_argument("--causal", action="store_true", help="是否使用因果掩码")
-    parser.add_argument("--dtype", type=str, default="fp16", choices=["fp16", "bf16"], help="计算精度")
-    parser.add_argument("--warmup", type=int, default=50, help="预热轮次")
-    parser.add_argument("--iters", type=int, default=300, help="计时轮次")
-    parser.add_argument("--bwd", action="store_true", help="是否计量反向")
+    parser = argparse.ArgumentParser(description="PyTorch SDPA MHA benchmark.")
+    parser.add_argument("--batch", type=int, required=True, help="Batch size B")
+    parser.add_argument("--seq_len", type=int, required=True, help="Sequence length S")
+    parser.add_argument("--heads", type=int, required=True, help="Number of attention heads H")
+    parser.add_argument("--dim", type=int, required=True, help="Per-head dimension Hd")
+    parser.add_argument("--causal", action="store_true", help="Whether to use causal mask")
+    parser.add_argument("--dtype", type=str, default="fp16", choices=["fp16", "bf16"], help="Computation precision")
+    parser.add_argument("--warmup", type=int, default=50, help="Warmup rounds")
+    parser.add_argument("--iters", type=int, default=300, help="Timing rounds")
+    parser.add_argument("--bwd", action="store_true", help="Whether to measure backward")
     args = parser.parse_args()
 
     dtype = torch.float16 if args.dtype == "fp16" else torch.bfloat16
@@ -391,7 +390,7 @@ def main() -> None:
         device="cuda:0",
     )
 
-    # 如未提供外部输入，这里生成固定随机输入
+    # If no external input is provided, generate fixed random input here
     q, k, v = _make_inputs(kernel.cfg, torch.device("cuda:0"))
     metrics = kernel.profile(
         q=q, k=k, v=v,
@@ -415,7 +414,7 @@ def main() -> None:
         bt_str = f"{bt:.2f} TFLOPs" if bt is not None else "N/A"
         print(f"[Result-BWD] avg_latency = {bms_str} | throughput = {bt_str}")
 
-    print(f"[Info] softmax_scale 默认值 = 1/sqrt(Hd) = {1.0 / math.sqrt(args.dim):.6f}")
+    print(f"[Info] softmax_scale default = 1/sqrt(Hd) = {1.0 / math.sqrt(args.dim):.6f}")
 
 
 if __name__ == "__main__":

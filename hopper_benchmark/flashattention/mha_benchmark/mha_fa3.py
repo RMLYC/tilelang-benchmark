@@ -12,8 +12,6 @@ refactored into a class that exposes forward/backward and a profile() API.
 - Optional "tune" flag: if a public autotuning API is available in your
   flash-attn build, this class will attempt to call it; otherwise it becomes
   a no-op warmup hook.
-
-Style: Google Python Style.
 """
 
 from __future__ import annotations
