@@ -26,6 +26,8 @@ from typing import Dict, List, Tuple
 import torch
 import pandas as pd
 
+from mha_utils import make_inputs
+
 # Try importing the FA3 wrapper (prefer fa3_bench_mha.py, fallback to fa_bench_mha.py)
 try:
     from mha_fa3 import FA3MHAKernel as FA3Kernel  # type: ignore

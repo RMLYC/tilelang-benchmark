@@ -109,7 +109,7 @@ class FA3MHAKernel:
         import flash_attn_interface as fai
 
         if q is None or k is None or v is None:
-            q, k, v = make_inputs(self.cfg, self.device)
+            q, k, v, _ = make_inputs(self.cfg.batch, self.cfg.seq_len, self.cfg.heads, self.cfg.dim, self.device, self.cfg.dtype)
 
         # Ensure dtype/device and disable grad for pure inference.
         q = q.to(device=self.device, dtype=self.cfg.dtype)
@@ -144,7 +144,7 @@ class FA3MHAKernel:
 
         # Prepare inputs: either from the last forward or freshly generated.
         if self._last_q is None or self._last_k is None or self._last_v is None:
-            q, k, v = make_inputs(self.cfg, self.device)
+            q, k, v, dout = make_inputs(self.cfg.batch, self.cfg.seq_len, self.cfg.heads, self.cfg.dim, self.device, self.cfg.dtype)
         else:
             q, k, v = self._last_q.clone(), self._last_k.clone(), self._last_v.clone()
 
@@ -182,6 +182,10 @@ class FA3MHAKernel:
     # ----------------------------- Profiling ----------------------------- #
 
     def profile(self,
+                q: Optional[torch.Tensor] = None,
+                k: Optional[torch.Tensor] = None,
+                v: Optional[torch.Tensor] = None,
+                dout: Optional[torch.Tensor] = None,
                 warmup: int = 50,
                 iters: int = 300,
                 do_backward: bool = False,
@@ -207,9 +211,19 @@ class FA3MHAKernel:
         cfg = self.cfg
         device = self.device
 
-        # Prepare base inputs and a fixed upstream grad for fair timing.
-        q, k, v = make_inputs(cfg, device)
-        dout = torch.randn_like(q)
+        if q is None or k is None or v is None or dout is None:
+            q, k, v, dout = make_inputs(cfg.batch, cfg.seq_len, cfg.heads, cfg.dim, device, cfg.dtype)
+        else:
+            q = q.to(device=device, dtype=cfg.dtype)
+            k = k.to(device=device, dtype=cfg.dtype)
+            v = v.to(device=device, dtype=cfg.dtype)
+            dout = dout.to(device=device, dtype=cfg.dtype)
+
+        # Fix input for fair timing
+        q_f = q.detach()
+        k_f = k.detach()
+        v_f = v.detach()
+        dout_f = dout.detach()
 
         # Local helper to run a single forward.
         def _fwd_once(q_, k_, v_) -> torch.Tensor:
@@ -219,7 +233,7 @@ class FA3MHAKernel:
 
         # Warmup forward-only.
         for _ in range(max(1, warmup)):
-            out = _fwd_once(q, k, v)
+            out = _fwd_once(q_f, k_f, v_f)
             torch.cuda.synchronize()
 
         # Measure forward-only.
@@ -228,7 +242,7 @@ class FA3MHAKernel:
         total_fwd_ms = 0.0
         for _ in range(iters):
             starter.record()
-            out = _fwd_once(q, k, v)
+            out = _fwd_once(q_f, k_f, v_f)
             ender.record()
             torch.cuda.synchronize()
             total_fwd_ms += starter.elapsed_time(ender)
@@ -252,9 +266,6 @@ class FA3MHAKernel:
                 out = _fwd_once(q_b, k_b, v_b)
                 loss = (out * dout).float().mean()
                 loss.backward()
-                for t in (q_b, k_b, v_b):
-                    if t.grad is not None:
-                        t.grad.zero_()
                 torch.cuda.synchronize()
 
             # Measure fwd+bwd.
@@ -351,7 +362,10 @@ def run_fa3_benchmark(
     cc_major, cc_minor = torch.cuda.get_device_capability(dev_idx)
 
     d_model = heads * dim
+    q, k, v, dout = make_inputs(kernel.cfg.batch, kernel.cfg.seq_len, kernel.cfg.heads, kernel.cfg.dim, torch.device("cuda:0"), kernel.cfg.dtype)
     metrics = kernel.profile(
+        q=q, k=k, v=v,
+        dout=dout,
         warmup=warmup,
         iters=iters,
         do_backward=bool(bwd),

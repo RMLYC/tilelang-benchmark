@@ -19,7 +19,7 @@ import torch
 import torch.nn.functional as F
 from contextlib import nullcontext
 
-from mha_utils import MHAConfig, attn_flops_forward, attn_flops_forward_backward
+from mha_utils import MHAConfig, attn_flops_forward, attn_flops_forward_backward, make_inputs
 
 
 # ================================ Utilities ================================ #
@@ -234,15 +234,13 @@ class TorchMHAKernel:
         cfg = self.cfg
         device = self.device
 
-        if q is None or k is None or v is None:
-            q, k, v = make_inputs(cfg, device)
+        if q is None or k is None or v is None or dout is None:
+            q, k, v, dout = make_inputs(cfg.batch, cfg.seq_len, cfg.heads, cfg.dim, device, cfg.dtype)
         else:
             q = q.to(device=device, dtype=cfg.dtype)
             k = k.to(device=device, dtype=cfg.dtype)
             v = v.to(device=device, dtype=cfg.dtype)
-
-        if dout is None:
-            dout = torch.randn_like(q)
+            dout = dout.to(device=device, dtype=cfg.dtype)
 
         # Fix input for fair timing
         q_f = q.detach()
@@ -355,10 +353,10 @@ def main() -> None:
     )
 
     # If no external input is provided, generate fixed random input here
-    q, k, v = make_inputs(kernel.cfg, torch.device("cuda:0"))
+    q, k, v, dout = make_inputs(kernel.cfg.batch, kernel.cfg.seq_len, kernel.cfg.heads, kernel.cfg.dim, torch.device("cuda:0"), kernel.cfg.dtype)
     metrics = kernel.profile(
         q=q, k=k, v=v,
-        dout=None,
+        dout=dout,
         warmup=args.warmup,
         iters=args.iters,
         do_backward=bool(args.bwd),
