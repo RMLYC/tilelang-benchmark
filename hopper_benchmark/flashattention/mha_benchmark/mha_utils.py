@@ -35,21 +35,6 @@ def attn_flops_forward_backward(cfg: MHAConfig) -> float:
     """
     return 3.5 * attn_flops_forward(cfg)
 
-# def make_inputs(cfg: MHAConfig, device: torch.device, seed: int = 17
-#                  ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-#     """Create random Q, K, V tensors.
-
-#     Shapes:
-#       Q, K, V: [B, S, H, Hd] in {fp16, bf16}
-#     """
-#     g = torch.Generator(device=device)
-#     g.manual_seed(seed)
-#     q = torch.randn(cfg.batch, cfg.seq_len, cfg.heads, cfg.dim,
-#                     device=device, dtype=cfg.dtype, generator=g)
-#     k = torch.randn_like(q, memory_format=torch.contiguous_format)
-#     v = torch.randn_like(q, memory_format=torch.contiguous_format)
-#     dout = torch.randn_like(q, memory_format=torch.contiguous_format)
-    # return q, k, v, dout
 
 def make_inputs(batch: int, seq_len: int, heads: int, dim: int,
                  device: torch.device, dtype: torch.dtype,
