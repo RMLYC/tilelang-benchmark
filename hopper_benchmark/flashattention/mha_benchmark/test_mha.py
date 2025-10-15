@@ -5,7 +5,8 @@ test_mha_compare.py
 
 Read MHA shape parameters from a CSV, run forward/backward with both FA-3
 and PyTorch SDPA implementations, verify numerical consistency, profile
-latency and TFLOPs, print a console table, and save results to a CSV.
+latency and TFLOPs, print a console table (latency & TFLOPs only), and save
+results to an .xlsx file.
 
 Required CSV columns (case/underscore insensitive; see alias mapping):
   batch, seq_len, heads, dim, causal
@@ -23,7 +24,9 @@ import os
 from typing import Dict, List, Tuple
 
 import torch
+import pandas as pd
 
+# Try importing the FA3 wrapper (prefer fa3_bench_mha.py, fallback to fa_bench_mha.py)
 try:
     from mha_fa3 import FA3MHAKernel as FA3Kernel  # type: ignore
 except Exception:
@@ -127,7 +130,7 @@ def _max_abs_rel_diff(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-6) -> Tu
 
 # ================================ Main Logic ================================ #
 
-def run_compare(input_csv: str, warmup: int, iters: int, output_csv: str,
+def run_compare(input_csv: str, warmup: int, iters: int, output_xlsx: str,
                 dtype: str = "fp16", device: str = "cuda:0",
                 atol: float = 1e-2, rtol: float = 2e-2) -> None:
     """Run full comparison and profiling, then print and persist results."""
@@ -137,7 +140,7 @@ def run_compare(input_csv: str, warmup: int, iters: int, output_csv: str,
     dt = {"fp16": torch.float16, "bf16": torch.bfloat16}[dtype.lower()]
     dev = torch.device(device)
 
-    rows, headers = _sniff_open_csv(input_csv)
+    rows, _ = _sniff_open_csv(input_csv)
     if not rows:
         raise ValueError("Input CSV is empty.")
 
@@ -147,13 +150,13 @@ def run_compare(input_csv: str, warmup: int, iters: int, output_csv: str,
     print(f"[Args] warmup={warmup} iters={iters} dtype={dt} device={device}")
     print()
 
-    out_rows: List[Dict[str, object]] = []
+    results_for_excel: List[Dict[str, object]] = []
 
-    # Console table header
+    # Console table header (latency & TFLOPs only)
     header_print = (
         "Idx  B     S      H    Hd   Causal  "
-        "FA3 Fwd(ms)  Torch Fwd(ms)  "
-        "FA3 Bwd(ms)  Torch Bwd(ms)  "
+        "FA3 Fwd(ms)  FA3 Fwd(TF)  FA3 Bwd(ms)  FA3 Bwd(TF)  "
+        "Torch Fwd(ms)  Torch Fwd(TF)  Torch Bwd(ms)  Torch Bwd(TF)"
     )
     print(header_print)
     print("-" * len(header_print))
@@ -175,10 +178,10 @@ def run_compare(input_csv: str, warmup: int, iters: int, output_csv: str,
         out_fa3 = fa3.forward(q, k, v, softmax_scale=None)
         out_torch = torch_mha.forward(q, k, v, softmax_scale=None)
 
-        # Forward consistency check
+        # Consistency checks (not printed; still enforced)
         ok_fwd = torch.allclose(out_fa3, out_torch, atol=atol, rtol=rtol)
-        out_abs, out_rel = _max_abs_rel_diff(out_fa3, out_torch)
         if not ok_fwd:
+            out_abs, out_rel = _max_abs_rel_diff(out_fa3, out_torch)
             raise AssertionError(
                 f"[FWD Mismatch] idx={idx} B={batch} S={seq_len} H={heads} Hd={dim} "
                 f"max_abs={out_abs:.4e} max_rel={out_rel:.4e}"
@@ -188,16 +191,15 @@ def run_compare(input_csv: str, warmup: int, iters: int, output_csv: str,
         dQ_fa3, dK_fa3, dV_fa3 = fa3.backward(dout=dout, softmax_scale=None)
         dQ_t, dK_t, dV_t = torch_mha.backward(q, k, v, dout=dout, softmax_scale=None)
 
-        # Backward consistency check
-        dq_abs, _ = _max_abs_rel_diff(dQ_fa3, dQ_t)
-        dk_abs, _ = _max_abs_rel_diff(dK_fa3, dK_t)
-        dv_abs, _ = _max_abs_rel_diff(dV_fa3, dV_t)
         ok_bwd = (
             torch.allclose(dQ_fa3, dQ_t, atol=atol, rtol=rtol)
             and torch.allclose(dK_fa3, dK_t, atol=atol, rtol=rtol)
             and torch.allclose(dV_fa3, dV_t, atol=atol, rtol=rtol)
         )
         if not ok_bwd:
+            dq_abs, _ = _max_abs_rel_diff(dQ_fa3, dQ_t)
+            dk_abs, _ = _max_abs_rel_diff(dK_fa3, dK_t)
+            dv_abs, _ = _max_abs_rel_diff(dV_fa3, dV_t)
             raise AssertionError(
                 f"[BWD Mismatch] idx={idx} B={batch} S={seq_len} H={heads} Hd={dim} "
                 f"dQ_abs={dq_abs:.4e} dK_abs={dk_abs:.4e} dV_abs={dv_abs:.4e}"
@@ -208,8 +210,7 @@ def run_compare(input_csv: str, warmup: int, iters: int, output_csv: str,
         torch_metrics = torch_mha.profile(q=q, k=k, v=v, dout=dout,
                                           warmup=warmup, iters=iters, do_backward=True)
 
-        # Aggregate one record
-        rec: Dict[str, object] = {
+        rec = {
             "idx": idx,
             "batch": batch,
             "seq_len": seq_len,
@@ -224,38 +225,28 @@ def run_compare(input_csv: str, warmup: int, iters: int, output_csv: str,
             "torch_fwd_tflops": round(float(torch_metrics["fwd_tflops"]), 4),
             "torch_bwd_ms": round(float(torch_metrics["bwd_latency_ms"]), 4) if torch_metrics["bwd_latency_ms"] is not None else None,
             "torch_bwd_tflops": round(float(torch_metrics["bwd_tflops"]), 4) if torch_metrics["bwd_tflops"] is not None else None,
-            "fwd_max_abs_diff": round(out_abs, 6),
-            "fwd_max_rel_diff": round(out_rel, 6),
-            "dQ_max_abs_diff": round(dq_abs, 6),
-            "dK_max_abs_diff": round(dk_abs, 6),
-            "dV_max_abs_diff": round(dv_abs, 6),
         }
-        out_rows.append(rec)
+        results_for_excel.append(rec)
 
-        # Print one formatted row on console
+        # Console print (latency & TFLOPs only)
         print(
             f"{idx:<4d}{batch:<6d}{seq_len:<7d}{heads:<5d}{dim:<5d}{str(causal):<8s}"
-            f"{rec['fa3_fwd_ms']!s:<11s}{rec['torch_fwd_ms']!s:<14s}"
-            f"{rec['fwd_max_abs_diff']!s:<9s}{rec['fwd_max_rel_diff']!s:<9s}"
-            f"{rec['fa3_bwd_ms']!s:<11s}{rec['torch_bwd_ms']!s:<14s}"
-            f"{rec['dQ_max_abs_diff']!s:<9s}{rec['dK_max_abs_diff']!s:<10s}{rec['dV_max_abs_diff']!s:<9s}"
+            f"{rec['fa3_fwd_ms']!s:<12s}{rec['fa3_fwd_tflops']!s:<13s}"
+            f"{rec['fa3_bwd_ms']!s:<12s}{rec['fa3_bwd_tflops']!s:<13s}"
+            f"{rec['torch_fwd_ms']!s:<14s}{rec['torch_fwd_tflops']!s:<14s}"
+            f"{rec['torch_bwd_ms']!s:<14s}{rec['torch_bwd_tflops']!s:<13s}"
         )
 
-    # Persist results to CSV
-    os.makedirs(os.path.dirname(os.path.abspath(output_csv)) or ".", exist_ok=True)
-    fieldnames = [
+    # Persist results to XLSX (latency & TFLOPs table)
+    os.makedirs(os.path.dirname(os.path.abspath(output_xlsx)) or ".", exist_ok=True)
+    df = pd.DataFrame(results_for_excel, columns=[
         "idx", "batch", "seq_len", "heads", "dim", "causal",
         "fa3_fwd_ms", "fa3_fwd_tflops", "fa3_bwd_ms", "fa3_bwd_tflops",
         "torch_fwd_ms", "torch_fwd_tflops", "torch_bwd_ms", "torch_bwd_tflops",
-        "fwd_max_abs_diff", "fwd_max_rel_diff", "dQ_max_abs_diff", "dK_max_abs_diff", "dV_max_abs_diff",
-    ]
-    with open(output_csv, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(out_rows)
-
+    ])
+    df.to_excel(output_xlsx, index=False)
     print()
-    print(f"[Saved] Results written to: {output_csv}")
+    print(f"[Saved] Results written to: {output_xlsx}")
 
 
 def main() -> None:
@@ -263,7 +254,7 @@ def main() -> None:
     parser.add_argument("--input_csv", type=str, required=True, help="Path to input shapes CSV")
     parser.add_argument("--warmup", type=int, default=20, help="Warmup iterations")
     parser.add_argument("--iters", type=int, default=100, help="Measured iterations")
-    parser.add_argument("--output_csv", type=str, required=True, help="Path to output results CSV")
+    parser.add_argument("--output_xlsx", type=str, required=True, help="Path to output results .xlsx")
     parser.add_argument("--dtype", type=str, default="fp16", choices=["fp16", "bf16"], help="Computation dtype")
     parser.add_argument("--device", type=str, default="cuda:0", help="CUDA device, e.g., cuda:0")
     parser.add_argument("--atol", type=float, default=1e-2, help="Absolute tolerance for allclose")
@@ -274,7 +265,7 @@ def main() -> None:
         input_csv=args.input_csv,
         warmup=args.warmup,
         iters=args.iters,
-        output_csv=args.output_csv,
+        output_xlsx=args.output_xlsx,
         dtype=args.dtype,
         device=args.device,
         atol=args.atol,
