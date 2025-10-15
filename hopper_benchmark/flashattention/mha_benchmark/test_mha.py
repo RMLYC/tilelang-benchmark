@@ -33,17 +33,16 @@ except Exception:
     raise ImportError(
         "Failed to import FA3MHAKernel. Ensure fa3_bench_mha.py or fa_bench_mha.py "
         "is present in the same directory and importable."
-    ) from e
+    )
 
 # Import the PyTorch SDPA wrapper
 try:
     from mha_pytorch import TorchMHAKernel  # type: ignore
-except Exception as e:
+except Exception:
     raise ImportError(
         "Failed to import TorchMHAKernel. Ensure torch_bench_mha.py is present in the "
         "same directory and importable."
-    ) from e
-
+    )
 
 # ================================ Utilities ================================ #
 

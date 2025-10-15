@@ -19,7 +19,7 @@ import torch
 import torch.nn.functional as F
 from contextlib import nullcontext
 
-from .mha_utils import MHAConfig, attn_flops_forward, attn_flops_forward_backward
+from mha_utils import MHAConfig, attn_flops_forward, attn_flops_forward_backward
 
 
 # ================================ Utilities ================================ #
@@ -47,22 +47,6 @@ def _sdpa_fastest_ctx():
             )
         except Exception:
             return nullcontext()
-
-
-def _make_inputs(cfg: MHAConfig, device: torch.device, seed: int = 17
-                 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Generate random Q, K, V according to config.
-
-    Shapes:
-      Q, K, V: [B, S, H, Hd]
-    """
-    g = torch.Generator(device=device)
-    g.manual_seed(seed)
-    q = torch.randn(cfg.batch, cfg.seq_len, cfg.heads, cfg.dim,
-                    device=device, dtype=cfg.dtype, generator=g)
-    k = torch.randn_like(q, memory_format=torch.contiguous_format)
-    v = torch.randn_like(q, memory_format=torch.contiguous_format)
-    return q, k, v
 
 
 # ================================ Kernel Class ============================= #
@@ -251,7 +235,7 @@ class TorchMHAKernel:
         device = self.device
 
         if q is None or k is None or v is None:
-            q, k, v = _make_inputs(cfg, device)
+            q, k, v = make_inputs(cfg, device)
         else:
             q = q.to(device=device, dtype=cfg.dtype)
             k = k.to(device=device, dtype=cfg.dtype)
@@ -371,7 +355,7 @@ def main() -> None:
     )
 
     # If no external input is provided, generate fixed random input here
-    q, k, v = _make_inputs(kernel.cfg, torch.device("cuda:0"))
+    q, k, v = make_inputs(kernel.cfg, torch.device("cuda:0"))
     metrics = kernel.profile(
         q=q, k=k, v=v,
         dout=None,

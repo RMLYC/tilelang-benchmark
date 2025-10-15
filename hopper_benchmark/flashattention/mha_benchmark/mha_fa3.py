@@ -19,7 +19,7 @@ from typing import Dict, Optional, Tuple
 
 import torch
 
-from .mha_utils import MHAConfig, attn_flops_forward, attn_flops_forward_backward, make_inputs
+from mha_utils import MHAConfig, attn_flops_forward, attn_flops_forward_backward, make_inputs
 
 
 # ================================ Utilities ================================ #
