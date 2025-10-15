@@ -18,6 +18,7 @@ from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+from contextlib import nullcontext
 
 from mha_config import MHAConfig
 
@@ -30,20 +31,24 @@ def _require_cuda() -> None:
         raise RuntimeError("未检测到可用的 CUDA 设备。请在支持 CUDA 的环境下运行。")
 
 
-def _enable_fastest_sdp() -> None:
-    """启用 PyTorch SDPA 的最快后端配置。
-
-    说明:
-      在 Ampere 或 Hopper 设备上，Flash 后端通常最快。若不满足条件，则退化为
-      memory efficient 后端。此设置对 forward 与 backward 都生效。
+def _sdpa_fastest_ctx():
+    """返回一个上下文，优先选择最快的 SDPA 后端。
+    优先 FLASH_ATTENTION，其次 EFFICIENT_ATTENTION（PyTorch 2.5+）。
+    若新 API 不可用，则回退到旧 API；再不行就空上下文。
     """
     try:
-        torch.backends.cuda.sdp_kernel(enable_flash=True,
-                                       enable_math=False,
-                                       enable_mem_efficient=True)
+        from torch.nn.attention import sdpa_kernel, SDPBackend
+        # 新 API：按优先级指定后端
+        return sdpa_kernel(backends=[SDPBackend.FLASH_ATTENTION])
     except Exception:
-        # 某些旧版 PyTorch 无此接口，忽略即可，后端会按默认策略选择。
-        pass
+        # 老版本回退（在新版本上会给出弃用告警，但可用）
+        try:
+            return torch.backends.cuda.sdp_kernel(
+                enable_flash=True, enable_math=False, enable_mem_efficient=True
+            )
+        except Exception:
+            return nullcontext()
+
 
 
 def attn_flops_forward(cfg: MHAConfig) -> float:
@@ -106,7 +111,6 @@ class TorchMHAKernel:
           device: 设备字符串, 例如 "cuda:0"
         """
         _require_cuda()
-        _enable_fastest_sdp()
 
         self.cfg = MHAConfig(
             batch=batch,
@@ -154,13 +158,14 @@ class TorchMHAKernel:
         v_bhsd = v.transpose(1, 2)
 
         # is_causal 控制下三角掩码。scale 可覆盖默认缩放
-        out_bhsd = F.scaled_dot_product_attention(
-            q_bhsd, k_bhsd, v_bhsd,
-            attn_mask=None,
-            dropout_p=0.0,
-            is_causal=cfg.causal,
-            scale=softmax_scale
-        )
+        with _sdpa_fastest_ctx():
+            out_bhsd = F.scaled_dot_product_attention(
+                q_bhsd, k_bhsd, v_bhsd,
+                attn_mask=None,
+                dropout_p=0.0,
+                is_causal=cfg.causal,
+                scale=softmax_scale
+            )
         out = out_bhsd.transpose(1, 2).contiguous()  # 回到 [B, S, H, D]
         return out
 
@@ -197,13 +202,14 @@ class TorchMHAKernel:
         k_bhsd = k.transpose(1, 2)
         v_bhsd = v.transpose(1, 2)
 
-        out_bhsd = F.scaled_dot_product_attention(
-            q_bhsd, k_bhsd, v_bhsd,
-            attn_mask=None,
-            dropout_p=0.0,
-            is_causal=cfg.causal,
-            scale=softmax_scale
-        )
+        with _sdpa_fastest_ctx():
+            out_bhsd = F.scaled_dot_product_attention(
+                q_bhsd, k_bhsd, v_bhsd,
+                attn_mask=None,
+                dropout_p=0.0,
+                is_causal=cfg.causal,
+                scale=softmax_scale
+            )
         out = out_bhsd.transpose(1, 2).contiguous()
 
         if dout is None:
@@ -283,13 +289,13 @@ class TorchMHAKernel:
 
         def _fwd_once(q_, k_, v_) -> torch.Tensor:
             # 转为 [B, H, S, D]
-            return F.scaled_dot_product_attention(
-                q_.transpose(1, 2), k_.transpose(1, 2), v_.transpose(1, 2),
-                attn_mask=None,
-                dropout_p=0.0,
-                is_causal=cfg.causal,
-                scale=softmax_scale
-            ).transpose(1, 2).contiguous()
+            with _sdpa_fastest_ctx():
+                out = F.scaled_dot_product_attention(
+                    q_.transpose(1, 2), k_.transpose(1, 2), v_.transpose(1, 2),
+                    attn_mask=None, dropout_p=0.0,
+                    is_causal=cfg.causal, scale=softmax_scale
+                )
+            return out.transpose(1, 2).contiguous()
 
         # 预热前向
         for _ in range(max(1, warmup)):

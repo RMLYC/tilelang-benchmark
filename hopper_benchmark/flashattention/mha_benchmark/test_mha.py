@@ -130,7 +130,7 @@ def _max_abs_rel_diff(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-6) -> Tu
 
 # ================================ Main Logic ================================ #
 
-def run_compare(input_csv: str, warmup: int, iters: int, output_xlsx: str,
+def run_compare(input_params: str, warmup: int, iters: int, output: str,
                 dtype: str = "fp16", device: str = "cuda:0",
                 atol: float = 1e-2, rtol: float = 2e-2) -> None:
     """Run full comparison and profiling, then print and persist results."""
@@ -140,7 +140,9 @@ def run_compare(input_csv: str, warmup: int, iters: int, output_xlsx: str,
     dt = {"fp16": torch.float16, "bf16": torch.bfloat16}[dtype.lower()]
     dev = torch.device(device)
 
-    rows, _ = _sniff_open_csv(input_csv)
+    output_path = output if output.lower().endswith(".xlsx") else f"{output}.xlsx"
+
+    rows, _ = _sniff_open_csv(input_params)
     if not rows:
         raise ValueError("Input CSV is empty.")
 
@@ -238,23 +240,22 @@ def run_compare(input_csv: str, warmup: int, iters: int, output_xlsx: str,
         )
 
     # Persist results to XLSX (latency & TFLOPs table)
-    os.makedirs(os.path.dirname(os.path.abspath(output_xlsx)) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)) or ".", exist_ok=True)
     df = pd.DataFrame(results_for_excel, columns=[
         "idx", "batch", "seq_len", "heads", "dim", "causal",
         "fa3_fwd_ms", "fa3_fwd_tflops", "fa3_bwd_ms", "fa3_bwd_tflops",
         "torch_fwd_ms", "torch_fwd_tflops", "torch_bwd_ms", "torch_bwd_tflops",
     ])
-    df.to_excel(output_xlsx, index=False)
-    print()
-    print(f"[Saved] Results written to: {output_xlsx}")
+    df.to_excel(output_path, index=False)
+    print(f"[Saved] Results written to: {output_path}")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="FA-3 vs PyTorch MHA correctness & performance test")
-    parser.add_argument("--input_csv", type=str, required=True, help="Path to input shapes CSV")
+    parser.add_argument("--input_params", type=str, required=True, help="Path to input shapes CSV")
     parser.add_argument("--warmup", type=int, default=20, help="Warmup iterations")
     parser.add_argument("--iters", type=int, default=100, help="Measured iterations")
-    parser.add_argument("--output_xlsx", type=str, required=True, help="Path to output results .xlsx")
+    parser.add_argument("--output", type=str, required=True, help="Output name ('.xlsx' appended if missing)")
     parser.add_argument("--dtype", type=str, default="fp16", choices=["fp16", "bf16"], help="Computation dtype")
     parser.add_argument("--device", type=str, default="cuda:0", help="CUDA device, e.g., cuda:0")
     parser.add_argument("--atol", type=float, default=1e-2, help="Absolute tolerance for allclose")
@@ -262,10 +263,10 @@ def main() -> None:
     args = parser.parse_args()
 
     run_compare(
-        input_csv=args.input_csv,
+        input_params=args.input_params,
         warmup=args.warmup,
         iters=args.iters,
-        output_xlsx=args.output_xlsx,
+        output=args.output,
         dtype=args.dtype,
         device=args.device,
         atol=args.atol,
