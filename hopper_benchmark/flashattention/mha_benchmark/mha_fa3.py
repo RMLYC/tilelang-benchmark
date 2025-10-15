@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-fa3_bench_mha.py
+mha_fa3.py
 
 Benchmark Multi-Head Attention (FlashAttention-3 core) with random inputs,
 refactored into a class that exposes forward/backward and a profile() API.
@@ -9,9 +9,6 @@ refactored into a class that exposes forward/backward and a profile() API.
 - Inputs: batch, seq_len, heads, dim_per_head, causal
 - Generates random Q/K/V on CUDA (or accepts user-provided tensors).
 - Measures latency (ms) and TFLOPs of the FA-3 kernel forward and backward.
-- Optional "tune" flag: if a public autotuning API is available in your
-  flash-attn build, this class will attempt to call it; otherwise it becomes
-  a no-op warmup hook.
 """
 
 from __future__ import annotations
@@ -22,7 +19,7 @@ from typing import Dict, Optional, Tuple
 
 import torch
 
-from mha_config import MHAConfig
+from .mha_utils import MHAConfig, attn_flops_forward, attn_flops_forward_backward, make_inputs
 
 
 # ================================ Utilities ================================ #
@@ -47,43 +44,6 @@ def _require_fa3() -> None:
         )
 
 
-def attn_flops_forward(cfg: MHAConfig) -> float:
-    """Return forward FLOPs for attention core (QK^T and P·V).
-
-    FLOPs ≈ 4 * B * H * S^2 * Hd
-    - QK^T: 2 * B * H * S * S * Hd
-    - Softmax omitted (treated as lower-order constant here).
-    - P·V:  2 * B * H * S * S * Hd
-    """
-    B, H, S, Hd = cfg.batch, cfg.heads, cfg.seq_len, cfg.dim
-    return 4.0 * B * H * (S ** 2) * Hd
-
-
-def attn_flops_forward_backward(cfg: MHAConfig) -> float:
-    """Approximate FLOPs for forward+backward of attention core.
-
-    Empirical rule of thumb: backward is ~2× forward (dV, dK/dQ, softmax bwd).
-    We use: FWD_BWD ≈ 3 × FWD.
-    """
-    return 3.5 * attn_flops_forward(cfg)
-
-
-def _make_inputs(cfg: MHAConfig, device: torch.device, seed: int = 17
-                 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Create random Q, K, V tensors.
-
-    Shapes:
-      Q, K, V: [B, S, H, Hd] in {fp16, bf16}
-    """
-    g = torch.Generator(device=device)
-    g.manual_seed(seed)
-    q = torch.randn(cfg.batch, cfg.seq_len, cfg.heads, cfg.dim,
-                    device=device, dtype=cfg.dtype, generator=g)
-    k = torch.randn_like(q, memory_format=torch.contiguous_format)
-    v = torch.randn_like(q, memory_format=torch.contiguous_format)
-    return q, k, v
-
-
 # ================================ Kernel Class ============================= #
 
 
@@ -97,8 +57,7 @@ class FA3MHAKernel:
                  dim: int,
                  causal: bool,
                  dtype: torch.dtype = torch.float16,
-                 device: str = "cuda:0",
-                 tune: bool = False) -> None:
+                 device: str = "cuda:0") -> None:
         """Initialize the kernel configuration and runtime context.
 
         Args:
@@ -109,7 +68,6 @@ class FA3MHAKernel:
           causal: Use causal mask if True.
           dtype: torch.float16 or torch.bfloat16.
           device: CUDA device string.
-          tune: If True, attempt autotuning when supported; otherwise acts as a no-op.
         """
         _require_fa3()
 
@@ -123,7 +81,6 @@ class FA3MHAKernel:
             dropout_p=0.0,
         )
         self.device = torch.device(device)
-        self.tune = tune
 
         # Cache for last tensors used in forward to support backward().
         self._last_q: Optional[torch.Tensor] = None
@@ -131,12 +88,8 @@ class FA3MHAKernel:
         self._last_v: Optional[torch.Tensor] = None
         self._last_out: Optional[torch.Tensor] = None
 
-        # Opportunistic autotune hook.
-        self._attempt_autotune_if_available()
-
     # ----------------------------- Core APIs ----------------------------- #
 
-    @torch.inference_mode(False)
     def forward(self,
                 q: Optional[torch.Tensor] = None,
                 k: Optional[torch.Tensor] = None,
@@ -156,7 +109,7 @@ class FA3MHAKernel:
         import flash_attn_interface as fai
 
         if q is None or k is None or v is None:
-            q, k, v = _make_inputs(self.cfg, self.device)
+            q, k, v = make_inputs(self.cfg, self.device)
 
         # Ensure dtype/device and disable grad for pure inference.
         q = q.to(device=self.device, dtype=self.cfg.dtype)
@@ -174,7 +127,6 @@ class FA3MHAKernel:
         self._last_out = out
         return out
 
-    @torch.inference_mode(False)
     def backward(self,
                  dout: Optional[torch.Tensor] = None,
                  softmax_scale: Optional[float] = None
@@ -192,7 +144,7 @@ class FA3MHAKernel:
 
         # Prepare inputs: either from the last forward or freshly generated.
         if self._last_q is None or self._last_k is None or self._last_v is None:
-            q, k, v = _make_inputs(self.cfg, self.device)
+            q, k, v = make_inputs(self.cfg, self.device)
         else:
             q, k, v = self._last_q.clone(), self._last_k.clone(), self._last_v.clone()
 
@@ -229,7 +181,6 @@ class FA3MHAKernel:
 
     # ----------------------------- Profiling ----------------------------- #
 
-    @torch.inference_mode(False)
     def profile(self,
                 warmup: int = 50,
                 iters: int = 300,
@@ -257,7 +208,7 @@ class FA3MHAKernel:
         device = self.device
 
         # Prepare base inputs and a fixed upstream grad for fair timing.
-        q, k, v = _make_inputs(cfg, device)
+        q, k, v = make_inputs(cfg, device)
         dout = torch.randn_like(q)
 
         # Local helper to run a single forward.
@@ -265,9 +216,6 @@ class FA3MHAKernel:
             return fai.flash_attn_func(q_, k_, v_,
                                        softmax_scale=softmax_scale,
                                        causal=cfg.causal)
-
-        # Tuning hook (no-op if unsupported).
-        self._maybe_tune_for_inputs(q, k, v)
 
         # Warmup forward-only.
         for _ in range(max(1, warmup)):
@@ -339,45 +287,6 @@ class FA3MHAKernel:
             "bwd_tflops": None if bwd_tflops is None else float(bwd_tflops),
         }
 
-    # ---------------------------- Tuning Hooks ---------------------------- #
-
-    def _attempt_autotune_if_available(self) -> None:
-        """Try to enable FA-3 autotuning if the API exists, otherwise no-op.
-
-        Note:
-          As of flash-attn==2.8.3, there is no public Python autotune API for FA-3.
-          This hook is written defensively: if your local build exposes a function
-          (e.g., `flash_attn_interface.autotune(enable=True)`), it will be called.
-        """
-        if not self.tune:
-            return
-        try:
-            import flash_attn_interface as fai
-            # Example defensive probes (no public API guaranteed).
-            if hasattr(fai, "autotune") and callable(getattr(fai, "autotune")):
-                fai.autotune(enable=True)  # type: ignore[attr-defined]
-                print("[Tuning] Enabled flash_attn_interface.autotune(True).")
-            elif hasattr(fai, "set_autotune") and callable(getattr(fai, "set_autotune")):
-                fai.set_autotune(True)  # type: ignore[attr-defined]
-                print("[Tuning] Enabled flash_attn_interface.set_autotune(True).")
-            else:
-                print("[Tuning] No public FA-3 autotune API found; proceeding without it.")
-        except Exception as _:
-            print("[Tuning] Autotune probe failed; proceeding without it.")
-
-    def _maybe_tune_for_inputs(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None:
-        """Per-input tuning placeholder. Currently a no-op unless your build exposes APIs.
-
-        Args:
-          q: Query tensor.
-          k: Key tensor.
-          v: Value tensor.
-        """
-        # Intentionally left minimal; extend here if your local build provides
-        # per-shape tuning entry points.
-        return
-
-
 # =================================== CLI =================================== #
 
 
@@ -392,7 +301,6 @@ def run_fa3_benchmark(
     warmup: int = 50,
     iters: int = 300,
     bwd: bool = False,
-    tune: bool = False,
     device: str = "cuda:0",
     verbose: bool = True,
 ) -> Dict[str, Optional[float]]:
@@ -411,7 +319,6 @@ def run_fa3_benchmark(
       warmup: Number of warmup iterations before timing.
       iters: Number of measured iterations.
       bwd: If True, also time forward+backward and report backward-only latency.
-      tune: Attempt autotuning if your flash-attn build exposes a public API.
       device: CUDA device, e.g., "cuda:0".
       verbose: If True, print a human-readable summary.
 
@@ -434,8 +341,7 @@ def run_fa3_benchmark(
         dim=dim,
         causal=bool(causal),
         dtype=dtype,          # type: ignore[arg-type]
-        device=device,
-        tune=bool(tune),
+        device=device
     )
 
     # Device info (respect an explicit device index if provided).
@@ -493,11 +399,6 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=50, help="Warmup iterations.")
     parser.add_argument("--iters", type=int, default=300, help="Measured iterations.")
     parser.add_argument("--bwd", action="store_true", help="Include backward timing.")
-    parser.add_argument(
-        "--tune",
-        action="store_true",
-        help="Attempt autotuning if supported by your build.",
-    )
     args = parser.parse_args()
 
     # Delegate to the programmatic API (prints by default).
@@ -511,7 +412,6 @@ def main() -> None:
         warmup=args.warmup,
         iters=args.iters,
         bwd=bool(args.bwd),
-        tune=bool(args.tune),
         device="cuda:0",
         verbose=True,
     )

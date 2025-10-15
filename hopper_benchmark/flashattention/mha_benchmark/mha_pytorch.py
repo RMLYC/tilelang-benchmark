@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-torch_bench_mha.py
+mha_torch.py
 
 Benchmark for Multi-Head Attention using PyTorch native SDPA.
 The goal is to invoke the most efficient kernel backend on supported GPUs,
@@ -19,7 +19,7 @@ import torch
 import torch.nn.functional as F
 from contextlib import nullcontext
 
-from mha_config import MHAConfig
+from .mha_utils import MHAConfig, attn_flops_forward, attn_flops_forward_backward
 
 
 # ================================ Utilities ================================ #
@@ -47,26 +47,6 @@ def _sdpa_fastest_ctx():
             )
         except Exception:
             return nullcontext()
-
-
-
-def attn_flops_forward(cfg: MHAConfig) -> float:
-    """Approximate FLOPs for forward pass, only counting main QK^T and P·V terms.
-
-    Formula:
-      FLOPs ≈ 4 * B * H * S^2 * Hd
-    """
-    B, H, S, Hd = cfg.batch, cfg.heads, cfg.seq_len, cfg.dim
-    return 4.0 * B * H * (S ** 2) * Hd
-
-
-def attn_flops_forward_backward(cfg: MHAConfig) -> float:
-    """Estimate total FLOPs for forward plus backward.
-
-    Empirical rule:
-      Backward is about twice the forward, so FWD_BWD ≈ 3.5 × FWD.
-    """
-    return 3.5 * attn_flops_forward(cfg)
 
 
 def _make_inputs(cfg: MHAConfig, device: torch.device, seed: int = 17
